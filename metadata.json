@@ -1,0 +1,6 @@
+{
+  "name": "Artify",
+  "description": "Artify is a professional, modern, and premium online store specializing in professional art supplies, paints, brushes, and creative tools.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

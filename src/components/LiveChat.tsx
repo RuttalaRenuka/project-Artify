@@ -8,6 +8,7 @@ export default function LiveChat() {
   const { supportOpen, setSupportOpen, navigateTo } = useApp();
   const [inputText, setInputText] = useState('');
   const [copied, setCopied] = useState(false);
+  const [isTyping, setIsTyping] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'welcome',
@@ -23,43 +24,60 @@ export default function LiveChat() {
     if (messagesEndRef.current) {
       messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [messages, supportOpen]);
+  }, [messages, supportOpen, isTyping]);
 
-  // Local keywords parser
-  const getBotResponse = (userText: string): string => {
-    const text = userText.toLowerCase();
+  const parseInlineStyles = (partStr: string) => {
+    const regex = /\*\*(.*?)\*\*/g;
+    const parts = [];
+    let lastIndex = 0;
+    let match;
 
-    if (text.includes('hello') || text.includes('hi') || text.includes('hey')) {
-      return "Hello fellow creator! How can I inspire your creative flow today? You can ask about paints, canvas, brushes, or custom orders.";
-    }
-    if (text.includes('acrylic') || text.includes('pour') || text.includes('fluid')) {
-      return "Ah, Acrylics! We have our signature 'Artify Masterpiece Acrylic Set (24 Colors)' and the therapeutic 'Chameleon Fluid Art Pour Kit' in stock. Type 'acrylic' in the Shop page to explore them!";
-    }
-    if (text.includes('watercolor') || text.includes('water color') || text.includes('water-color')) {
-      return "Watercolor is beautiful for transparent washes. I highly recommend our cold-pressed 'Velvet Horizon Professional Watercolor Palette' or our beginner self-guided 'Botanical Watercolor DIY Starter Kit'.";
-    }
-    if (text.includes('brush') || text.includes('brushes')) {
-      return "Brushes hold the soul of detail! Our 'Fineline Series Synthetic Brush Bundle (8 Pcs)' consists of soft nylon hairs that snappingly snap back to clean fine tips. Check them out on our product list!";
-    }
-    if (text.includes('coupon') || text.includes('discount') || text.includes('offer') || text.includes('promo')) {
-      return "Indeed, we have special codes! You can apply code: CREATIVE10 to save 10% on your first checkout. For larger art commissions, save 20% on orders above ₹100 with code: ARTIFYMASTER.";
-    }
-    if (text.includes('canvas') || text.includes('easel') || text.includes('stand')) {
-      return "We have beautiful French Oak timber studio H-frame easels and archival triple-primed linen canvases. They hold heavy impasto paints flawlessly.";
-    }
-    if (text.includes('shipping') || text.includes('deliver') || text.includes('free')) {
-      return "Artify offers FREE pristine shipping nationwide for all supply orders exceeding ₹50. All materials are securely packaged inside eco-friendly boxes.";
-    }
-    if (text.includes('resin') || text.includes('craft')) {
-      return "Explore our 'Dreamscape Epoxy Resin Craft Bundle' featuring clear glass hardener formulas and organic metallic mica pigments.";
+    while ((match = regex.exec(partStr)) !== null) {
+      if (match.index > lastIndex) {
+        parts.push(partStr.substring(lastIndex, match.index));
+      }
+      parts.push(<strong key={match.index} className="font-bold text-slate-950">{match[1]}</strong>);
+      lastIndex = regex.lastIndex;
     }
 
-    return "Fascinating choice! For specific supplies, please visit our Shop page where you can search through our advanced catalog. You can also contact our studio managers directly at support@artify.com.";
+    if (lastIndex < partStr.length) {
+      parts.push(partStr.substring(lastIndex));
+    }
+
+    return parts.length > 0 ? parts : partStr;
   };
 
-  const handleSendMessage = (e: React.FormEvent) => {
+  const renderFormattedText = (text: string) => {
+    const lines = text.split('\n');
+    return lines.map((line, idx) => {
+      if (line.startsWith('### ')) {
+        return <h4 key={idx} className="font-bold text-xs text-slate-900 mt-2 mb-1">{parseInlineStyles(line.slice(4))}</h4>;
+      }
+      if (line.startsWith('## ')) {
+        return <h3 key={idx} className="font-bold text-sm text-slate-900 mt-3 mb-1">{parseInlineStyles(line.slice(3))}</h3>;
+      }
+      if (line.startsWith('# ')) {
+        return <h2 key={idx} className="font-extrabold text-sm text-slate-950 mt-4 mb-2">{parseInlineStyles(line.slice(2))}</h2>;
+      }
+      if (line.startsWith('- ') || line.startsWith('* ')) {
+        return (
+          <div key={idx} className="flex items-start gap-1.5 ml-2 my-0.5">
+            <span className="text-violet-500 font-bold">•</span>
+            <span className="flex-1">{parseInlineStyles(line.slice(2))}</span>
+          </div>
+        );
+      }
+      return (
+        <div key={idx} className="min-h-[4px] leading-relaxed my-0.5">
+          {parseInlineStyles(line)}
+        </div>
+      );
+    });
+  };
+
+  const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inputText.trim()) return;
+    if (!inputText.trim() || isTyping) return;
 
     const userMessage: ChatMessage = {
       id: `m-user-${Date.now()}`,
@@ -71,17 +89,50 @@ export default function LiveChat() {
     setMessages((prev) => [...prev, userMessage]);
     const originalInput = inputText;
     setInputText('');
+    setIsTyping(true);
 
-    // Simulate typing
-    setTimeout(() => {
-      const serverMessage: ChatMessage = {
-        id: `m-bot-${Date.now()}`,
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          messages: messages.concat(userMessage),
+          userMessage: originalInput
+        })
+      });
+
+      const data = await response.json();
+      setIsTyping(false);
+
+      if (response.ok && data.text) {
+        const botMessage: ChatMessage = {
+          id: `m-bot-${Date.now()}`,
+          sender: 'assistant',
+          text: data.text,
+          time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
+        };
+        setMessages((prev) => [...prev, botMessage]);
+      } else {
+        const errorMessage: ChatMessage = {
+          id: `m-bot-err-${Date.now()}`,
+          sender: 'assistant',
+          text: data.error || "I'm having trouble connecting to the Artify Studio engine right now. Please check standard connection or secret key configurations.",
+          time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
+        };
+        setMessages((prev) => [...prev, errorMessage]);
+      }
+    } catch (error) {
+      setIsTyping(false);
+      const errorMessage: ChatMessage = {
+        id: `m-bot-err-${Date.now()}`,
         sender: 'assistant',
-        text: getBotResponse(originalInput),
+        text: "Could not establish server connection to Artify Creative Studio API.",
         time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
       };
-      setMessages((prev) => [...prev, serverMessage]);
-    }, 800);
+      setMessages((prev) => [...prev, errorMessage]);
+    }
   };
 
   const handleCopyCode = () => {
@@ -111,7 +162,7 @@ export default function LiveChat() {
                     Artify Creative Tutor <Sparkles className="w-3.5 h-3.5 text-yellow-200" />
                   </h3>
                   <span className="text-[10px] text-orange-100 flex items-center gap-1">
-                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block animation-ping" />
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block animate-ping" />
                     Always painting ready!
                   </span>
                 </div>
@@ -153,7 +204,7 @@ export default function LiveChat() {
                           : 'bg-white text-slate-800 border border-slate-100 rounded-tl-none'
                       }`}
                     >
-                      <p className="whitespace-pre-wrap">{msg.text}</p>
+                      <div>{renderFormattedText(msg.text)}</div>
                       <span
                         className={`text-[9px] block mt-1 text-right ${
                           isUser ? 'text-violet-200' : 'text-slate-400'
@@ -165,6 +216,19 @@ export default function LiveChat() {
                   </div>
                 );
               })}
+
+              {isTyping && (
+                <div className="flex justify-start">
+                  <div className="max-w-[80%] rounded-2xl px-4 py-2.5 text-xs shadow-sm bg-white text-slate-800 border border-slate-100 rounded-tl-none">
+                    <div className="flex items-center space-x-1.5 py-1">
+                      <span className="w-1.5 h-1.5 bg-violet-600 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                      <span className="w-1.5 h-1.5 bg-violet-600 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                      <span className="w-1.5 h-1.5 bg-violet-600 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                    </div>
+                  </div>
+                </div>
+              )}
+
               <div ref={messagesEndRef} />
             </div>
 
@@ -173,15 +237,17 @@ export default function LiveChat() {
               <input
                 id="live-chat-input"
                 type="text"
-                placeholder="Ask e.g. 'acrylic', 'watercolor', 'discount'..."
+                placeholder={isTyping ? "AI is processing your inspiration..." : "Ask e.g. 'acrylic', 'watercolor', 'discount'..."}
+                disabled={isTyping}
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
-                className="flex-1 text-xs border border-slate-200 rounded-xl px-3 py-2.5 outline-none focus:ring-1 focus:ring-violet-500"
+                className="flex-1 text-xs border border-slate-200 rounded-xl px-3 py-2.5 outline-none focus:ring-1 focus:ring-violet-500 disabled:opacity-50"
               />
               <button
                 id="live-chat-send"
                 type="submit"
-                className="bg-violet-600 hover:bg-violet-750 text-white p-2.5 rounded-xl flex items-center justify-center shadow-md shadow-violet-100 cursor-pointer"
+                disabled={isTyping}
+                className="bg-violet-600 hover:bg-violet-750 text-white p-2.5 rounded-xl flex items-center justify-center shadow-md shadow-violet-100 cursor-pointer disabled:opacity-50"
                 title="Send message"
               >
                 <Send className="w-4.5 h-4.5" />

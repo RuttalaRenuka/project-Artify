@@ -1,6 +1,71 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { Product, CartItem, Address, PaymentMethod, OrderItem, Coupon } from '../types';
 import { products, coupons } from '../data';
+import { auth, db } from '../lib/firebase';
+import { 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword, 
+  signOut, 
+  onAuthStateChanged,
+  User as FirebaseUser
+} from 'firebase/auth';
+import { 
+  doc, 
+  getDoc, 
+  setDoc, 
+  updateDoc, 
+  collection, 
+  query, 
+  where, 
+  getDocs
+} from 'firebase/firestore';
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData?.map(provider => ({
+        providerId: provider.providerId,
+        email: provider.email,
+      })) || []
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
 
 interface AppContextType {
   cart: CartItem[];
@@ -17,6 +82,8 @@ interface AppContextType {
     orders: OrderItem[];
     notifications: string[];
   };
+  firebaseUser: FirebaseUser | null;
+  firebaseLoading: boolean;
   searchQuery: string;
   setSearchQuery: (query: string) => void;
   setSupportOpen: (open: boolean) => void;
@@ -35,6 +102,9 @@ interface AppContextType {
   placeOrder: (shippingAddress: Address, paymentMethod: PaymentMethod) => { success: boolean; orderId: string };
   addNotification: (message: string) => void;
   clearNotifications: () => void;
+  signInWithFirebase: (email: string, pass: string) => Promise<{ success: boolean; message: string }>;
+  signUpWithFirebase: (name: string, email: string, pass: string) => Promise<{ success: boolean; message: string }>;
+  signOutWithFirebase: () => Promise<void>;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -63,7 +133,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const [supportOpen, setSupportOpen] = useState<boolean>(false);
 
-  // Profile and Orders persistence
+  // Firestore user + loading state
+  const [firebaseUser, setFirebaseUser] = useState<FirebaseUser | null>(null);
+  const [firebaseLoading, setFirebaseLoading] = useState<boolean>(true);
+
+  // Profile and Orders local fallback
   const [user, setUser] = useState(() => {
     const defaultAddresses: Address[] = [
       {
@@ -148,7 +222,79 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   });
 
-  // Save changes to localStorage
+  // Track Auth state changed and load database synced content
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (fUser) => {
+      setFirebaseLoading(true);
+      if (fUser) {
+        setFirebaseUser(fUser);
+        try {
+          const userDocRef = doc(db, 'users', fUser.uid);
+          const userDocSnap = await getDoc(userDocRef);
+          
+          let addresses: Address[] = [];
+          let paymentMethods: PaymentMethod[] = [];
+          let notifications: string[] = [
+            `🎨 Secured Firebase environment synchronized! Logged in as ${fUser.email}.`
+          ];
+          let userName = fUser.displayName || fUser.email?.split('@')[0] || 'Artify Creator';
+
+          if (userDocSnap.exists()) {
+            const data = userDocSnap.data();
+            addresses = data.addresses || [];
+            paymentMethods = data.paymentMethods || [];
+            if (data.name) userName = data.name;
+          } else {
+            // Initiate dynamic file record if first time registration
+            const initialUserData = {
+              uid: fUser.uid,
+              name: userName,
+              email: fUser.email || '',
+              addresses: [],
+              paymentMethods: [],
+              createdAt: new Date().toISOString()
+            };
+            await setDoc(userDocRef, initialUserData);
+          }
+
+          // Fetch user's orders from "orders" collection
+          const ordersQuery = query(collection(db, 'orders'), where('userId', '==', fUser.uid));
+          const querySnapshot = await getDocs(ordersQuery);
+          const loadedOrders: OrderItem[] = [];
+          querySnapshot.forEach((docSnap) => {
+            loadedOrders.push(docSnap.data() as OrderItem);
+          });
+
+          // Sort loadedOrders by date in descending order
+          loadedOrders.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+          setUser({
+            name: userName,
+            email: fUser.email || '',
+            addresses,
+            paymentMethods,
+            orders: loadedOrders.length > 0 ? loadedOrders : [],
+            notifications
+          });
+        } catch (error) {
+          console.error("Error loading user profile details from Firestore:", error);
+          handleFirestoreError(error, OperationType.GET, `users/${fUser.uid}`);
+        }
+      } else {
+        setFirebaseUser(null);
+        // Load details from localStorage when Guest/unauthenticated
+        const saved = localStorage.getItem('artify_user');
+        if (saved) {
+          setUser(JSON.parse(saved));
+        }
+      }
+      setFirebaseLoading(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Local state persistence
   useEffect(() => {
     localStorage.setItem('artify_cart', JSON.stringify(cart));
   }, [cart]);
@@ -158,8 +304,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   }, [wishlist]);
 
   useEffect(() => {
-    localStorage.setItem('artify_user', JSON.stringify(user));
-  }, [user]);
+    if (!firebaseUser) {
+      localStorage.setItem('artify_user', JSON.stringify(user));
+    }
+  }, [user, firebaseUser]);
 
   useEffect(() => {
     if (activeCoupon) {
@@ -177,7 +325,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     } else if (tab !== 'product-detail') {
       setSelectedProductId(null);
     }
-    // Scroll to top of preview viewport
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
@@ -244,7 +391,6 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       return { success: false, message: 'Invalid coupon. Try coupon code "CREATIVE10"!' };
     }
 
-    // Spend limits
     const sub = cart.reduce((tot, item) => tot + item.product.price * item.quantity, 0);
     if (matched.minSpend && sub < matched.minSpend) {
       return { success: false, message: `This coupon requires a minimum subtotal spend of $${matched.minSpend}.` };
@@ -259,37 +405,77 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setActiveCoupon(null);
   };
 
-  const addAddress = (address: Address) => {
+  const addAddress = async (address: Address) => {
+    let updatedAddresses: Address[] = [];
     setUser((prev) => {
-      const updatedAddresses = address.isDefault
+      updatedAddresses = address.isDefault
         ? prev.addresses.map((a) => ({ ...a, isDefault: false })).concat(address)
         : prev.addresses.concat(address);
       return { ...prev, addresses: updatedAddresses };
     });
+
+    if (auth.currentUser) {
+      try {
+        const userDocRef = doc(db, 'users', auth.currentUser.uid);
+        await updateDoc(userDocRef, { addresses: updatedAddresses });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, `users/${auth.currentUser.uid}`);
+      }
+    }
     addNotification('Saved new shipping postal address.');
   };
 
-  const deleteAddress = (id: string) => {
-    setUser((prev) => ({
-      ...prev,
-      addresses: prev.addresses.filter((a) => a.id !== id)
-    }));
+  const deleteAddress = async (id: string) => {
+    let updatedAddresses: Address[] = [];
+    setUser((prev) => {
+      updatedAddresses = prev.addresses.filter((a) => a.id !== id);
+      return { ...prev, addresses: updatedAddresses };
+    });
+
+    if (auth.currentUser) {
+      try {
+        const userDocRef = doc(db, 'users', auth.currentUser.uid);
+        await updateDoc(userDocRef, { addresses: updatedAddresses });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, `users/${auth.currentUser.uid}`);
+      }
+    }
     addNotification('Address deleted successfully.');
   };
 
-  const addPaymentMethod = (card: PaymentMethod) => {
-    setUser((prev) => ({
-      ...prev,
-      paymentMethods: [...prev.paymentMethods, card]
-    }));
+  const addPaymentMethod = async (card: PaymentMethod) => {
+    let updatedPayments: PaymentMethod[] = [];
+    setUser((prev) => {
+      updatedPayments = [...prev.paymentMethods, card];
+      return { ...prev, paymentMethods: updatedPayments };
+    });
+
+    if (auth.currentUser) {
+      try {
+        const userDocRef = doc(db, 'users', auth.currentUser.uid);
+        await updateDoc(userDocRef, { paymentMethods: updatedPayments });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, `users/${auth.currentUser.uid}`);
+      }
+    }
     addNotification('Registered new active payment card to files.');
   };
 
-  const deletePaymentMethod = (id: string) => {
-    setUser((prev) => ({
-      ...prev,
-      paymentMethods: prev.paymentMethods.filter((p) => p.id !== id)
-    }));
+  const deletePaymentMethod = async (id: string) => {
+    let updatedPayments: PaymentMethod[] = [];
+    setUser((prev) => {
+      updatedPayments = prev.paymentMethods.filter((p) => p.id !== id);
+      return { ...prev, paymentMethods: updatedPayments };
+    });
+
+    if (auth.currentUser) {
+      try {
+        const userDocRef = doc(db, 'users', auth.currentUser.uid);
+        await updateDoc(userDocRef, { paymentMethods: updatedPayments });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, `users/${auth.currentUser.uid}`);
+      }
+    }
     addNotification('Payment record deleted from files.');
   };
 
@@ -303,8 +489,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const shipping = subtotal - discount > 50 ? 0 : 5.99;
     const total = subtotal - discount + shipping;
 
+    const orderId = `ORD-${Math.floor(10000 + Math.random() * 90000)}`;
     const newOrder: OrderItem = {
-      id: `ORD-${Math.floor(10000 + Math.random() * 90000)}`,
+      id: orderId,
       date: new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }),
       items: cart.map((c) => ({
         productId: c.product.id,
@@ -326,16 +513,28 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       orders: [newOrder, ...prev.orders]
     }));
 
+    if (auth.currentUser) {
+      const dbOrder = {
+        ...newOrder,
+        userId: auth.currentUser.uid
+      };
+      const orderDocRef = doc(db, 'orders', orderId);
+      setDoc(orderDocRef, dbOrder)
+        .catch((err) => {
+          handleFirestoreError(err, OperationType.CREATE, `orders/${orderId}`);
+        });
+    }
+
     clearCart();
     removeCoupon();
     addNotification(`Hooray! Custom supplies order ${newOrder.id} successfully queued for shipment!`);
-    return { success: true, orderId: newOrder.id };
+    return { success: true, orderId: orderId };
   };
 
   const addNotification = (message: string) => {
     setUser((prev) => ({
       ...prev,
-      notifications: [message, ...prev.notifications].slice(0, 15) // max 15
+      notifications: [message, ...prev.notifications].slice(0, 15)
     }));
   };
 
@@ -344,6 +543,50 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       ...prev,
       notifications: []
     }));
+  };
+
+  // Firebase auth bindings
+  const signInWithFirebase = async (email: string, pass: string) => {
+    try {
+      await signInWithEmailAndPassword(auth, email, pass);
+      addNotification(`Signed in successfully as ${email}. Welcome back to Artify!`);
+      return { success: true, message: 'Logged in successfully!' };
+    } catch (err: any) {
+      console.error(err);
+      return { success: false, message: err?.message || 'Authentication failed. Please check credentials.' };
+    }
+  };
+
+  const signUpWithFirebase = async (name: string, email: string, pass: string) => {
+    try {
+      const userCredential = await createUserWithEmailAndPassword(auth, email, pass);
+      const fUser = userCredential.user;
+      
+      const userDocRef = doc(db, 'users', fUser.uid);
+      await setDoc(userDocRef, {
+        uid: fUser.uid,
+        name: name,
+        email: email,
+        addresses: [],
+        paymentMethods: [],
+        createdAt: new Date().toISOString()
+      });
+
+      addNotification(`Registered successfully as ${email}. Welcome to Artify!`);
+      return { success: true, message: 'Account created successfully!' };
+    } catch (err: any) {
+      console.error(err);
+      return { success: false, message: err?.message || 'Registration failed. Try checking details or existing email.' };
+    }
+  };
+
+  const signOutWithFirebase = async () => {
+    try {
+      await signOut(auth);
+      addNotification('Signed out from Firebase secure node.');
+    } catch (err) {
+      console.error(err);
+    }
   };
 
   return (
@@ -356,6 +599,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         activeCoupon,
         supportOpen,
         user,
+        firebaseUser,
+        firebaseLoading,
         searchQuery,
         setSearchQuery,
         setSupportOpen,
@@ -373,7 +618,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         deletePaymentMethod,
         placeOrder,
         addNotification,
-        clearNotifications
+        clearNotifications,
+        signInWithFirebase,
+        signUpWithFirebase,
+        signOutWithFirebase
       }}
     >
       {children}
